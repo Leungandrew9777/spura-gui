@@ -1,5 +1,5 @@
 // spura-gui/src/pages/Dashboard.tsx
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { LeagueSelector } from "@/components/LeagueSelector"
 import { Progress } from "@/components/ui/progress"
@@ -19,39 +19,64 @@ interface LivePrediction {
 export default function Dashboard() {
   const [selectedLeague, setSelectedLeague] = useState<string>(Object.keys(leagues)[0])
   const [syncTaskId, setSyncTaskId] = useState<string | null>(null)
+  const [recalTaskId, setRecalTaskId] = useState<string | null>(null)
   const [predictions, setPredictions] = useState<LivePrediction[]>([])
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  const { lastMessage, isConnected } = useWebSocket(syncTaskId)
+  const syncWs = useWebSocket(syncTaskId)
+  const recalWs = useWebSocket(recalTaskId)
 
-  useEffect(() => {
-    let cancelled = false
+  const prevSyncConnected = useRef(false)
+  const prevRecalConnected = useRef(false)
+
+  const loadPredictions = useCallback(async () => {
     setLoading(true)
     setError(null)
-
-    const load = async () => {
-      try {
-        const res = await fetch(`${api.predictions(selectedLeague)}&min_ev=-1`)
-        if (!res.ok) throw new Error(`API error ${res.status}`)
-        const data = await res.json()
-        if (!cancelled) setPredictions(data.predictions || [])
-      } catch (e) {
-        if (!cancelled) {
-          setError(e instanceof Error ? e.message : 'Failed to load predictions')
-          setPredictions([])
+    try {
+      const res = await fetch(`${api.predictions(selectedLeague)}&min_ev=-1`)
+      if (!res.ok) {
+        let detail = `API error ${res.status}`
+        try {
+          const body = await res.json()
+          if (body?.detail) detail = body.detail
+        } catch {
+          // ignore non-JSON error bodies
         }
-      } finally {
-        if (!cancelled) setLoading(false)
+        throw new Error(detail)
       }
+      const data = await res.json()
+      setPredictions(data.predictions || [])
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Failed to load predictions')
+      setPredictions([])
+    } finally {
+      setLoading(false)
     }
-
-    load()
-    return () => { cancelled = true }
   }, [selectedLeague])
+
+  useEffect(() => {
+    loadPredictions()
+  }, [loadPredictions])
+
+  // Reload predictions once a background task finishes (websocket closes).
+  useEffect(() => {
+    if (prevSyncConnected.current && !syncWs.isConnected) {
+      loadPredictions()
+    }
+    prevSyncConnected.current = syncWs.isConnected
+  }, [syncWs.isConnected, loadPredictions])
+
+  useEffect(() => {
+    if (prevRecalConnected.current && !recalWs.isConnected) {
+      loadPredictions()
+    }
+    prevRecalConnected.current = recalWs.isConnected
+  }, [recalWs.isConnected, loadPredictions])
 
   const handleLeagueChange = (league: string) => {
     setSelectedLeague(league)
     setSyncTaskId(null)
+    setRecalTaskId(null)
   }
 
   const handleSyncData = async () => {
@@ -64,6 +89,28 @@ export default function Dashboard() {
       setError(e instanceof Error ? e.message : 'Sync failed')
     }
   }
+
+  const handleRecalibrate = async () => {
+    try {
+      const response = await fetch(api.recalibrate(selectedLeague), { method: 'POST' })
+      const data = await response.json()
+      setRecalTaskId(data.task_id)
+    } catch (e) {
+      console.error('Recalibrate failed:', e)
+      setError(e instanceof Error ? e.message : 'Recalibrate failed')
+    }
+  }
+
+  const progressFrom = (message: string | null) => {
+    if (!message) return 0
+    try {
+      return JSON.parse(message).progress || 0
+    } catch {
+      return 0
+    }
+  }
+
+  const busy = syncWs.isConnected || recalWs.isConnected
 
   return (
     <div className="container mx-auto p-4">
@@ -86,16 +133,33 @@ export default function Dashboard() {
               <button
                 className="w-full bg-blue-600 text-white py-2 rounded disabled:opacity-50"
                 onClick={handleSyncData}
-                disabled={isConnected}
+                disabled={busy}
               >
-                {isConnected ? 'Syncing...' : 'Sync Data'}
+                {syncWs.isConnected ? 'Syncing...' : 'Sync Data'}
               </button>
 
               {syncTaskId && (
                 <div className="text-sm text-gray-600">
                   Task ID: {syncTaskId}
-                  {lastMessage && (
-                    <Progress value={JSON.parse(lastMessage).progress || 0} className="mt-2" />
+                  {syncWs.lastMessage && (
+                    <Progress value={progressFrom(syncWs.lastMessage)} className="mt-2" />
+                  )}
+                </div>
+              )}
+
+              <button
+                className="w-full bg-emerald-600 text-white py-2 rounded disabled:opacity-50"
+                onClick={handleRecalibrate}
+                disabled={busy}
+              >
+                {recalWs.isConnected ? 'Recalibrating...' : 'Recalibrate Model'}
+              </button>
+
+              {recalTaskId && (
+                <div className="text-sm text-gray-600">
+                  Task ID: {recalTaskId}
+                  {recalWs.lastMessage && (
+                    <Progress value={progressFrom(recalWs.lastMessage)} className="mt-2" />
                   )}
                 </div>
               )}
